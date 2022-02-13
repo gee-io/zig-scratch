@@ -81,6 +81,35 @@ const Ring = struct {
     }
 };
 
+var global_stop = std.atomic.Atomic(bool).init(false);
+
+fn initSignalHandlers() !void {
+    // SIGPIPE is ignored, errors need to be handled on read/writes
+    os.sigaction(os.SIGPIPE, &.{
+        .handler = .{ .sigaction = os.SIG_IGN },
+        .mask = os.empty_sigset,
+        .flags = 0,
+    }, null);
+
+    // SIGTERM/SIGINT set global_stop
+    for ([_]os.SIG{
+        .INT,
+        .TERM,
+    }) |sig| {
+        os.sigaction(sig, &.{
+            .handler = .{
+                .handler = struct {
+                    fn wrapper(_: c_int) callconv(.C) void {
+                        global_stop.store(true, .SeqCst);
+                    }
+                }.wrapper,
+            },
+            .mask = os.empty_sigset,
+            .flags = 0,
+        }, null);
+    }
+}
+
 pub fn main() !void {
     // TODO: support other tcp-ish socket types
     // - tcp
@@ -115,6 +144,7 @@ pub fn main() !void {
         // TODO: install bcc and monitor tcp stuff + other utilization metrics.
         _ = try ring.uring.submit_and_wait(1);
 
+        // TODO: benchmark copy_cqes for a batch of [256] completions at a time.
         const cqe = try ring.uring.copy_cqe();
         switch (cqe.err()) {
             .SUCCESS => {},
@@ -152,9 +182,9 @@ pub fn main() !void {
                 // still in progress for the given client_fd (I think this can be a flush/nop,
                 // or maybe just a per fd ref count)
                 std.debug.print("complete.write: nbytes={}\n", .{cqe.res});
-                _ = try ring.queue_shutdown(token.client_fd, os.SHUT_RDWR);
+                _ = try ring.queue_close(token.client_fd);
             },
-            .close => {
+            .close, .shutdown => {
                 std.debug.print("complete.close\n", .{});
             },
         }
