@@ -17,13 +17,16 @@ const TT = union {
 };
 
 const Token = packed struct {
-    tag: enum(u32) {
+    tag: enum(u16) {
         accept,
         read,
+        read_fixed, // buf_idx
+        write_fixed,
         write,
         close,
         shutdown,
     },
+    buf_idx: i16 = -1,
     client_fd: os.fd_t = -1,
 };
 
@@ -67,6 +70,20 @@ const Ring = struct {
         }), client_fd, buffer, offset);
     }
 
+    fn queue_write_fixed(
+        self: *Ring,
+        client_fd: os.fd_t,
+        buffer: *os.iovec,
+        offset: u64,
+        buffer_index: u16,
+    ) !*io_uring_sqe {
+        const udata = Token{
+            .tag = .write,
+            .client_fd = client_fd,
+        };
+        return try self.uring.write_fixed(@bitCast(u64, udata), client_fd, buffer, offset, buffer_index);
+    }
+
     fn queue_write(
         self: *Ring,
         client_fd: os.fd_t,
@@ -77,6 +94,7 @@ const Ring = struct {
             .tag = .write,
             .client_fd = client_fd,
         };
+
         return try self.uring.write(@bitCast(u64, udata), client_fd, buffer, offset);
     }
 };
@@ -131,8 +149,19 @@ pub fn main() !void {
 
     _ = try ring.queue_accept(server);
 
-    var buffer_read = [_]u8{98} ** 20;
-    var buffer_write = [_]u8{98} ** 20;
+    const BUF_COUNT = 16;
+    const BUF_SIZE = 4096;
+    var raw_bufs: [BUF_COUNT][BUF_SIZE]u8 = undefined;
+    var buffers: [raw_bufs.len]std.os.iovec = undefined;
+    for (buffers) |*iovc, i| {
+        iovc.* = .{ .iov_base = &raw_bufs[i], .iov_len = raw_bufs[i].len };
+    }
+    const READ_BUF_IDX = 0;
+    try ring.uring.register_buffers(buffers[0..]);
+    var buffer_write = [_]u8{98} ** 3;
+
+    // std.mem.
+    // std.mem.copy(u8, &raw_bufs[0], "foobar");
 
     while (true) {
         // TODO: Write a golang client to fuzz bad behavior from clients (e.g. slow/other).
@@ -170,20 +199,37 @@ pub fn main() !void {
                 // We don't control what order the events are completed here.
                 // I think this is solved by using a pool (or dedicated per client)
                 // buffers + readv.
-                _ = try ring.queue_read(cqe.res, buffer_read[0..], @as(u64, 0));
+
+                const buf_idx = READ_BUF_IDX;
+                const offset = 0;
+                _ = try ring.uring.read_fixed(@bitCast(u64, Token{
+                    .tag = .read_fixed,
+                    .client_fd = cqe.res,
+                    .buf_idx = buf_idx,
+                }), cqe.res, &buffers[buf_idx], offset, buf_idx);
             },
-            .read => {
-                const data_read = buffer_read[0..@intCast(usize, cqe.res)];
-                std.debug.print("complete.read: {s}\n", .{data_read});
-                _ = try ring.queue_write(token.client_fd, buffer_write[0..], 0);
+            .read_fixed => {
+                // TODO: we are done with the buffer.
+                const data_read = raw_bufs[@intCast(usize, token.buf_idx)][0..@intCast(usize, cqe.res)];
+                std.debug.print("complete.read_fixed: {s}\n", .{data_read});
+                _ = try ring.uring.write(
+                    @bitCast(u64, Token{
+                        .tag = .write,
+                        .client_fd = token.client_fd,
+                    }),
+                    token.client_fd,
+                    buffer_write[0..],
+                    0,
+                );
             },
-            .write => {
+            .write_fixed, .write => {
                 // TODO: another ordering bug I think, we need to ensure that no sqe is
                 // still in progress for the given client_fd (I think this can be a flush/nop,
                 // or maybe just a per fd ref count)
                 std.debug.print("complete.write: nbytes={}\n", .{cqe.res});
                 _ = try ring.queue_close(token.client_fd);
             },
+            .read => unreachable,
             .close, .shutdown => {
                 std.debug.print("complete.close\n", .{});
             },
