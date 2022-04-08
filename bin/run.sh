@@ -10,9 +10,9 @@ make build
 
 scp zig-out/bin/*  "$REMOTE_HOST":/tmp/
 ssh -q "$REMOTE_HOST" <<'EOF'
-  pkill -e io_uring-tcp-hasher || true
+  kill -9 $(lsof -t -i:3131)
   mv /tmp/io_uring-tcp-hasher .
-  sleep 1
+  sleep 2
 
   set -m
   ./io_uring-tcp-hasher &
